@@ -1462,7 +1462,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_completed_usage_from_payload(_payload), do: nil
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") ||
+        Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") ||
+        Map.get(payload, :rateLimits)
 
     cond do
       rate_limits_map?(direct) ->
@@ -1514,8 +1518,12 @@ defmodule SymphonyElixir.Orchestrator do
     limit_id =
       Map.get(payload, "limit_id") ||
         Map.get(payload, :limit_id) ||
+        Map.get(payload, "limitId") ||
+        Map.get(payload, :limitId) ||
         Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
+        Map.get(payload, :limit_name) ||
+        Map.get(payload, "limitName") ||
+        Map.get(payload, :limitName)
 
     has_buckets =
       Enum.any?(

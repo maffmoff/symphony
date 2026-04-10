@@ -924,14 +924,31 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_rate_limits(rate_limits) when is_map(rate_limits) do
     limit_id =
-      map_value(rate_limits, ["limit_id", :limit_id, "limit_name", :limit_name]) ||
-        "unknown"
+      map_value(rate_limits, [
+        "limit_id",
+        :limit_id,
+        "limitId",
+        :limitId,
+        "limit_name",
+        :limit_name,
+        "limitName",
+        :limitName
+      ]) || "unknown"
+
+    plan = map_value(rate_limits, ["plan_type", :plan_type, "planType", :planType])
 
     primary = format_rate_limit_bucket(map_value(rate_limits, ["primary", :primary]))
     secondary = format_rate_limit_bucket(map_value(rate_limits, ["secondary", :secondary]))
     credits = format_rate_limit_credits(map_value(rate_limits, ["credits", :credits]))
 
-    colorize(to_string(limit_id), @ansi_yellow) <>
+    id_segment =
+      if is_binary(plan) and plan != "" do
+        "#{limit_id}/#{plan}"
+      else
+        to_string(limit_id)
+      end
+
+    colorize(id_segment, @ansi_yellow) <>
       colorize(" | ", @ansi_gray) <>
       colorize("primary #{primary}", @ansi_cyan) <>
       colorize(" | ", @ansi_gray) <>
@@ -952,6 +969,21 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_rate_limit_bucket(bucket) when is_map(bucket) do
     remaining = map_value(bucket, ["remaining", :remaining])
     limit = map_value(bucket, ["limit", :limit])
+
+    used_percent =
+      map_value(bucket, ["used_percent", :used_percent, "usedPercent", :usedPercent])
+
+    window_mins =
+      map_value(bucket, [
+        "window_minutes",
+        :window_minutes,
+        "windowMinutes",
+        :windowMinutes,
+        "window_duration_mins",
+        :window_duration_mins,
+        "windowDurationMins",
+        :windowDurationMins
+      ])
 
     reset_value =
       map_value(bucket, [
@@ -980,6 +1012,12 @@ defmodule SymphonyElixir.StatusDashboard do
         integer_like?(limit) ->
           "limit #{format_count(limit)}"
 
+        is_number(used_percent) and integer_like?(window_mins) ->
+          "#{format_used_percent(used_percent)}% / #{window_mins}m"
+
+        is_number(used_percent) ->
+          "#{format_used_percent(used_percent)}%"
+
         map_size(bucket) == 0 ->
           "n/a"
 
@@ -995,6 +1033,16 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_rate_limit_bucket(other), do: to_string(other)
+
+  defp format_used_percent(value) when is_float(value) do
+    if value == Float.round(value) do
+      Integer.to_string(trunc(value))
+    else
+      Float.to_string(value)
+    end
+  end
+
+  defp format_used_percent(value), do: to_string(value)
 
   defp format_rate_limit_credits(nil), do: "credits n/a"
 
