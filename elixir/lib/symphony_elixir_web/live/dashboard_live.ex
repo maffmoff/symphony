@@ -5,7 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
-  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter, RateLimitsDisplay}
   @runtime_tick_ms 1_000
 
   @impl true
@@ -114,7 +114,60 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </div>
 
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <%= cond do %>
+            <% is_nil(@payload.rate_limits) -> %>
+              <p class="empty-state">No rate-limit snapshot yet.</p>
+            <% RateLimitsDisplay.codex_shape?(@payload.rate_limits) -> %>
+              <p class="rate-limit-summary">
+                <span class="numeric"><%= RateLimitsDisplay.label(@payload.rate_limits) %></span>
+                <%= if plan = RateLimitsDisplay.plan(@payload.rate_limits) do %>
+                  <span class="muted"> · <%= plan %></span>
+                <% end %>
+              </p>
+
+              <section class="metric-grid">
+                <article
+                  :for={bucket <- RateLimitsDisplay.buckets(@payload.rate_limits, @now)}
+                  class="metric-card"
+                >
+                  <p class="metric-label"><%= bucket.title %></p>
+                  <p class="metric-value numeric"><%= bucket.used %></p>
+                  <p class="metric-detail">
+                    window <%= bucket.window %><br />
+                    resets <%= bucket.resets_relative %><br />
+                    <span class="muted numeric"><%= bucket.resets_absolute %></span>
+                  </p>
+                </article>
+                <%= if credits = RateLimitsDisplay.credits(@payload.rate_limits) do %>
+                  <article class="metric-card">
+                    <p class="metric-label">Credits</p>
+                    <p class="metric-value numeric"><%= credits %></p>
+                    <p class="metric-detail muted">Codex credit balance</p>
+                  </article>
+                <% end %>
+              </section>
+
+              <%= case RateLimitsDisplay.extras(@payload.rate_limits, @now) do %>
+                <% [] -> %>
+                <% extras -> %>
+                  <dl class="rate-limit-extras">
+                    <div :for={{key, value} <- extras} class="rate-limit-extra-row">
+                      <dt class="muted"><%= key %></dt>
+                      <dd class="numeric"><%= value %></dd>
+                    </div>
+                  </dl>
+              <% end %>
+            <% true -> %>
+              <dl class="rate-limit-generic">
+                <div
+                  :for={{path, value} <- RateLimitsDisplay.flatten(@payload.rate_limits, @now)}
+                  class="rate-limit-extra-row"
+                >
+                  <dt class="muted"><%= path %></dt>
+                  <dd class="numeric"><%= value %></dd>
+                </div>
+              </dl>
+          <% end %>
         </section>
 
         <section class="section-card">
@@ -324,7 +377,4 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
-
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
 end
