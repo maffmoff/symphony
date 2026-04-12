@@ -50,6 +50,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
+      field(:on_hold_state, :string, default: "On Hold")
+      field(:human_hold_label, :string, default: "human-hold")
+      field(:skip_labels, {:array, :string}, default: ["human-hold"])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -59,7 +62,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :assignee, :on_hold_state, :human_hold_label, :skip_labels, :active_states, :terminal_states],
         empty_values: []
       )
     end
@@ -131,6 +134,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
+      field(:max_attempts_per_run, :integer, default: 5)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
 
@@ -139,12 +143,13 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_attempts_per_run, :max_concurrent_agents_by_state],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> validate_number(:max_attempts_per_run, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
