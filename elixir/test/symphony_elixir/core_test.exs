@@ -766,7 +766,7 @@ defmodule SymphonyElixir.CoreTest do
 
   test "prompt builder renders issue and attempt values from workflow template" do
     workflow_prompt =
-      "Ticket {{ issue.identifier }} {{ issue.title }} labels={{ issue.labels }} attempt={{ attempt }}"
+      "Ticket {{ issue.identifier }} {{ issue.title }} labels={{ issue.labels }} attempt={{ attempt }} failure={{ failure_attempt }} reason={{ retry_reason }}"
 
     write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
 
@@ -779,11 +779,35 @@ defmodule SymphonyElixir.CoreTest do
       labels: ["backend"]
     }
 
-    prompt = PromptBuilder.build_prompt(issue, attempt: 3)
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        attempt: 3,
+        failure_attempt: 2,
+        retry_reason: "agent exited"
+      )
 
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+    assert prompt =~ "failure=2"
+    assert prompt =~ "reason=agent exited"
+  end
+
+  test "prompt builder supplies retry defaults for strict workflow templates" do
+    workflow_prompt = "failure={{ failure_attempt }} reason={{ retry_reason }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "S-2",
+      title: "Retry defaults",
+      description: "Render retry defaults",
+      state: "Todo",
+      url: "https://example.org/issues/S-2",
+      labels: []
+    }
+
+    assert PromptBuilder.build_prompt(issue) == "failure=0 reason="
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
