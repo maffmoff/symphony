@@ -2,6 +2,17 @@
 
 This directory contains the Elixir agent orchestration service that polls Linear, creates per-issue workspaces, and runs Codex in app-server mode.
 
+## Fork and PR Policy
+
+- This checkout may track the OpenAI OSS upstream, but AFML carries local
+  modifications in a fork workflow.
+- Never create, update, or suggest pull requests against `openai/symphony`.
+- Treat `openai/symphony` as read-only upstream for fetch, diff, and rebase only.
+- `https://github.com/maffmoff/symphony` is the writable AFML fork and may be
+  modified freely for AFML needs.
+- Push Symphony code changes and open pull requests only against the AFML fork
+  remote.
+
 ## Environment
 
 - Elixir: `1.19.x` (OTP 28) via `mise`.
