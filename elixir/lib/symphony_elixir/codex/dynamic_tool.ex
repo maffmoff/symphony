@@ -185,6 +185,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload({:linear_rate_limited, info}) when is_map(info) do
+    %{
+      "error" => %{
+        "message" => "Linear GraphQL request was rate limited.",
+        "code" => "RATELIMITED",
+        "duration_ms" => Map.get(info, :duration_ms),
+        "remaining" => Map.get(info, :remaining)
+      }
+    }
+  end
+
   defp tool_error_payload({:linear_api_request, reason}) do
     %{
       "error" => %{

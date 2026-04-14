@@ -458,6 +458,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client detects rate-limited graphql responses" do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, {:linear_rate_limited, %{duration_ms: 15_000, remaining: 0}}} =
+                 Client.graphql(
+                   "query Viewer { viewer { id } }",
+                   %{},
+                   request_fun: fn _payload, _headers ->
+                     {:ok,
+                      %{
+                        status: 400,
+                        body: %{
+                          "errors" => [
+                            %{
+                              "message" => "Linear rate limit exceeded",
+                              "extensions" => %{"code" => "RATELIMITED", "duration" => 15_000}
+                            }
+                          ],
+                          "statusCode" => 429
+                        }
+                      }}
+                   end
+                 )
+      end)
+
+    assert log =~ "Linear GraphQL request rate limited duration_ms=15000"
+    assert log =~ "RATELIMITED"
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",

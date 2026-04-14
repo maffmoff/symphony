@@ -515,6 +515,9 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "normal worker exit schedules active-state continuation retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
     issue_id = "issue-resume"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
@@ -555,6 +558,9 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
     issue_id = "issue-crash"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
@@ -595,6 +601,9 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "first abnormal worker exit waits before retrying" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
     issue_id = "issue-crash-initial"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
@@ -631,6 +640,43 @@ defmodule SymphonyElixir.CoreTest do
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+  end
+
+  test "rate-limited worker exit uses Linear reset duration for retry" do
+    issue_id = "issue-linear-rate-limited"
+    ref = make_ref()
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: ref,
+          identifier: "MT-562",
+          issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info(
+               {:DOWN, ref, :process, self(), {:linear_rate_limited, %{duration_ms: 45_000, remaining: 0}}},
+               state
+             )
+
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             identifier: "MT-562",
+             error: "linear rate limited",
+             linear_rate_limit: %{duration_ms: 45_000, remaining: 0}
+           } = updated_state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, 44_500, 45_500)
+    assert updated_state.linear_rate_limit_until_ms >= due_at_ms - 10
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
