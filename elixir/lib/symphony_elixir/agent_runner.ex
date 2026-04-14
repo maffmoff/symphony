@@ -20,6 +20,10 @@ defmodule SymphonyElixir.AgentRunner do
       :ok ->
         :ok
 
+      {:error, {:issue_state_refresh_failed, {:linear_rate_limited, info}}} ->
+        Logger.warning("Agent run paused by Linear rate limit for #{issue_context(issue)}: #{inspect(info)}")
+        exit({:linear_rate_limited, info})
+
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"

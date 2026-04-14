@@ -8,6 +8,11 @@ defmodule SymphonyElixir.Linear.Client do
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
+  @default_rate_limit_duration_ms 60_000
+  @hourly_request_window_ms 3_600_000
+  @hourly_request_limit 5_000
+  @hourly_request_warning_threshold 4_500
+  @request_counter_table __MODULE__.RequestCounter
 
   @query """
   query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
@@ -167,16 +172,28 @@ defmodule SymphonyElixir.Linear.Client do
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
 
     with {:ok, headers} <- graphql_headers(),
+         :ok <- track_linear_request_count(),
          {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
       {:ok, body}
     else
       {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
+        case rate_limit_info(response) do
+          {:ok, info} ->
+            Logger.warning(
+              "Linear GraphQL request rate limited duration_ms=#{info.duration_ms}" <>
+                linear_error_context(payload, response)
+            )
 
-        {:error, {:linear_api_status, response.status}}
+            {:error, {:linear_rate_limited, info}}
+
+          :error ->
+            Logger.error(
+              "Linear GraphQL request failed status=#{response.status}" <>
+                linear_error_context(payload, response)
+            )
+
+            {:error, {:linear_api_status, response.status}}
+        end
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
@@ -342,6 +359,159 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp maybe_put_operation_name(payload, _operation_name), do: payload
+
+  defp rate_limit_info(%{status: status} = response) when status in [400, 429] do
+    body = Map.get(response, :body)
+
+    with {:ok, decoded_body} <- decode_response_body(body),
+         true <- rate_limited_response?(decoded_body) do
+      {:ok,
+       %{
+         duration_ms: rate_limit_duration_ms(decoded_body),
+         remaining: rate_limit_remaining(decoded_body) || 0
+       }}
+    else
+      _ -> :error
+    end
+  end
+
+  defp rate_limit_info(_response), do: :error
+
+  defp decode_response_body(body) when is_map(body) or is_list(body), do: {:ok, body}
+
+  defp decode_response_body(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded_body} -> {:ok, decoded_body}
+      {:error, _reason} -> {:error, :invalid_json}
+    end
+  end
+
+  defp decode_response_body(_body), do: {:error, :unsupported_body}
+
+  defp rate_limited_response?(payload) do
+    payload
+    |> payload_values_for_keys(["code", :code])
+    |> Enum.any?(&rate_limit_code?/1)
+  end
+
+  defp rate_limit_code?(value) when is_binary(value), do: value == "RATELIMITED"
+  defp rate_limit_code?(value) when is_atom(value), do: Atom.to_string(value) == "RATELIMITED"
+  defp rate_limit_code?(_value), do: false
+
+  defp rate_limit_duration_ms(payload) do
+    payload_get_integer(payload, ["duration_ms", :duration_ms, "durationMs", :durationMs, "retryAfterMs", :retryAfterMs]) ||
+      payload_get_integer(payload, ["duration", :duration]) ||
+      rate_limit_retry_after_seconds(payload) ||
+      @default_rate_limit_duration_ms
+  end
+
+  defp rate_limit_retry_after_seconds(payload) do
+    case payload_get_integer(payload, ["retryAfter", :retryAfter, "retry_after", :retry_after]) do
+      duration when is_integer(duration) and duration > 0 -> duration * 1_000
+      _ -> nil
+    end
+  end
+
+  defp rate_limit_remaining(payload) do
+    payload_get_integer(payload, ["remaining", :remaining, "rateLimitRemaining", :rateLimitRemaining])
+  end
+
+  defp payload_get_integer(payload, keys) when is_list(keys) do
+    payload
+    |> payload_values_for_keys(keys)
+    |> Enum.find_value(&integer_like/1)
+  end
+
+  defp payload_values_for_keys(payload, keys) when is_map(payload) and is_list(keys) do
+    direct_values =
+      keys
+      |> Enum.flat_map(fn key ->
+        if Map.has_key?(payload, key), do: [Map.get(payload, key)], else: []
+      end)
+
+    nested_values =
+      payload
+      |> Map.values()
+      |> Enum.flat_map(&payload_values_for_keys(&1, keys))
+
+    direct_values ++ nested_values
+  end
+
+  defp payload_values_for_keys(payload, keys) when is_list(payload) and is_list(keys) do
+    Enum.flat_map(payload, &payload_values_for_keys(&1, keys))
+  end
+
+  defp payload_values_for_keys(_payload, _keys), do: []
+
+  defp integer_like(value) when is_integer(value), do: value
+
+  defp integer_like(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} -> integer
+      _ -> nil
+    end
+  end
+
+  defp integer_like(_value), do: nil
+
+  defp track_linear_request_count do
+    table = request_counter_table()
+    now_ms = System.system_time(:millisecond)
+    window_started_at_ms = div(now_ms, @hourly_request_window_ms) * @hourly_request_window_ms
+
+    reset_counter_window(table, window_started_at_ms)
+    count = :ets.update_counter(table, :request_count, {2, 1}, {:request_count, 0})
+    maybe_log_request_count_warning(table, count, window_started_at_ms)
+
+    :ok
+  end
+
+  defp request_counter_table do
+    case :ets.whereis(@request_counter_table) do
+      :undefined ->
+        try do
+          :ets.new(@request_counter_table, [:named_table, :public, read_concurrency: true, write_concurrency: true])
+        rescue
+          ArgumentError -> @request_counter_table
+        end
+
+      table ->
+        table
+    end
+  end
+
+  defp reset_counter_window(table, window_started_at_ms) do
+    case :ets.lookup(table, :window_started_at_ms) do
+      [{:window_started_at_ms, ^window_started_at_ms}] ->
+        :ok
+
+      _ ->
+        :ets.insert(table, [
+          {:window_started_at_ms, window_started_at_ms},
+          {:request_count, 0},
+          {:last_warning_bucket, nil}
+        ])
+
+        :ok
+    end
+  end
+
+  defp maybe_log_request_count_warning(table, count, window_started_at_ms)
+       when is_integer(count) and count >= @hourly_request_warning_threshold do
+    warning_bucket = div(count, 100)
+
+    case :ets.lookup(table, :last_warning_bucket) do
+      [{:last_warning_bucket, ^warning_bucket}] ->
+        :ok
+
+      _ ->
+        :ets.insert(table, {:last_warning_bucket, warning_bucket})
+
+        Logger.warning("Linear API request volume approaching rate limit count=#{count} limit=#{@hourly_request_limit} window_started_at_ms=#{window_started_at_ms}")
+    end
+  end
+
+  defp maybe_log_request_count_warning(_table, _count, _window_started_at_ms), do: :ok
 
   defp linear_error_context(payload, response) when is_map(payload) do
     operation_name =

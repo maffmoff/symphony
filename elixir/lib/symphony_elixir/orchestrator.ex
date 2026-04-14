@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @default_linear_rate_limit_delay_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -38,7 +39,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      linear_rate_limit_until_ms: nil
     ]
   end
 
@@ -109,7 +111,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    state = schedule_tick(state, next_poll_delay_ms(state))
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
@@ -139,6 +141,21 @@ defmodule SymphonyElixir.Orchestrator do
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
                 delay_type: :continuation,
+                worker_host: Map.get(running_entry, :worker_host),
+                workspace_path: Map.get(running_entry, :workspace_path)
+              })
+
+            {:linear_rate_limited, info} ->
+              Logger.warning("Agent task paused by Linear rate limit for issue_id=#{issue_id} session_id=#{session_id}; scheduling rate-limit-aware retry")
+
+              next_attempt = next_retry_attempt_from_running(running_entry)
+
+              state
+              |> apply_linear_rate_limit(info, "agent issue-state refresh")
+              |> schedule_issue_retry(issue_id, next_attempt, %{
+                identifier: running_entry.identifier,
+                error: "linear rate limited",
+                linear_rate_limit: info,
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
@@ -224,11 +241,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
-    with :ok <- Config.validate!(),
+    with false <- linear_rate_limited?(state),
+         :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
     else
+      true ->
+        Logger.debug("Skipping Linear poll while rate limited")
+        state
+
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
         state
@@ -263,6 +285,9 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
         state
 
+      {:error, {:linear_rate_limited, info}} ->
+        apply_linear_rate_limit(state, info, "candidate issue poll")
+
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
@@ -288,6 +313,9 @@ defmodule SymphonyElixir.Orchestrator do
             terminal_state_set()
           )
           |> reconcile_missing_running_issue_ids(running_ids, issues)
+
+        {:error, {:linear_rate_limited, info}} ->
+          apply_linear_rate_limit(state, info, "running issue state refresh")
 
         {:error, reason} ->
           Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
@@ -671,6 +699,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         state
 
+      {:error, {:linear_rate_limited, info}} ->
+        apply_linear_rate_limit(state, info, "dispatch revalidation")
+
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
         state
@@ -780,6 +811,7 @@ defmodule SymphonyElixir.Orchestrator do
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
+    linear_rate_limit = pick_retry_linear_rate_limit(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
@@ -803,6 +835,7 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            linear_rate_limit: linear_rate_limit,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -815,6 +848,7 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          linear_rate_limit: Map.get(retry_entry, :linear_rate_limit),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -832,6 +866,22 @@ defmodule SymphonyElixir.Orchestrator do
         issues
         |> find_issue_by_id(issue_id)
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+
+      {:error, {:linear_rate_limited, info}} ->
+        Logger.warning("Retry poll rate limited for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(info)}")
+
+        state = apply_linear_rate_limit(state, info, "retry poll")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             error: "retry poll rate limited",
+             linear_rate_limit: info
+           })
+         )}
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
@@ -926,10 +976,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    case linear_rate_limit_delay_ms(metadata[:linear_rate_limit]) do
+      delay_ms when is_integer(delay_ms) and delay_ms > 0 ->
+        delay_ms
+
+      _ ->
+        if metadata[:delay_type] == :continuation and attempt == 1 do
+          @continuation_retry_delay_ms
+        else
+          failure_retry_delay(attempt)
+        end
     end
   end
 
@@ -937,6 +993,59 @@ defmodule SymphonyElixir.Orchestrator do
     max_delay_power = min(attempt - 1, 10)
     min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
   end
+
+  defp linear_rate_limit_delay_ms(%{duration_ms: duration_ms}) do
+    positive_integer(duration_ms)
+  end
+
+  defp linear_rate_limit_delay_ms(%{"duration_ms" => duration_ms}) do
+    positive_integer(duration_ms)
+  end
+
+  defp linear_rate_limit_delay_ms(_info), do: nil
+
+  defp apply_linear_rate_limit(%State{} = state, info, context) do
+    delay_ms = linear_rate_limit_delay_ms(info) || @default_linear_rate_limit_delay_ms
+    until_ms = System.monotonic_time(:millisecond) + delay_ms
+
+    next_until_ms =
+      case state.linear_rate_limit_until_ms do
+        existing_until_ms when is_integer(existing_until_ms) -> max(existing_until_ms, until_ms)
+        _ -> until_ms
+      end
+
+    Logger.warning("Linear API rate limited during #{context}; pausing Linear polling for #{delay_ms}ms")
+
+    %{state | linear_rate_limit_until_ms: next_until_ms}
+  end
+
+  defp linear_rate_limited?(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+    is_integer(state.linear_rate_limit_until_ms) and state.linear_rate_limit_until_ms > now_ms
+  end
+
+  defp next_poll_delay_ms(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    case state.linear_rate_limit_until_ms do
+      until_ms when is_integer(until_ms) and until_ms > now_ms ->
+        max(state.poll_interval_ms, until_ms - now_ms)
+
+      _ ->
+        state.poll_interval_ms
+    end
+  end
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: value
+
+  defp positive_integer(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer > 0 -> integer
+      _ -> nil
+    end
+  end
+
+  defp positive_integer(_value), do: nil
 
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
   defp normalize_retry_attempt(_attempt), do: 0
@@ -954,6 +1063,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_error(previous_retry, metadata) do
     metadata[:error] || Map.get(previous_retry, :error)
+  end
+
+  defp pick_retry_linear_rate_limit(previous_retry, metadata) do
+    metadata[:linear_rate_limit] || Map.get(previous_retry, :linear_rate_limit)
   end
 
   defp pick_retry_worker_host(previous_retry, metadata) do

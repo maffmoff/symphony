@@ -263,6 +263,24 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              }
            }
 
+    rate_limited =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          {:error, {:linear_rate_limited, %{duration_ms: 45_000, remaining: 0}}}
+        end
+      )
+
+    assert Jason.decode!(rate_limited["output"]) == %{
+             "error" => %{
+               "message" => "Linear GraphQL request was rate limited.",
+               "code" => "RATELIMITED",
+               "duration_ms" => 45_000,
+               "remaining" => 0
+             }
+           }
+
     request_error =
       DynamicTool.execute(
         "linear_graphql",
